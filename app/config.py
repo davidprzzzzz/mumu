@@ -21,6 +21,18 @@ class Settings:
     public_url: str
     validate_twilio: bool
     timezone: str = "Europe/Paris"
+    # Services connectes. Sans ces valeurs, la connexion Google est desactivee.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    secret_key: str = ""
+    ingest_model: str = "claude-haiku-5-5"
+    sync_interval_seconds: int = 300
+
+    @property
+    def connections_enabled(self) -> bool:
+        return bool(
+            self.google_client_id and self.google_client_secret and self.secret_key and self.public_url
+        )
 
 
 def load_settings() -> Settings:
@@ -33,4 +45,9 @@ def load_settings() -> Settings:
         twilio_whatsapp_from=os.getenv("TWILIO_WHATSAPP_FROM", ""),
         public_url=os.getenv("PUBLIC_URL", "").rstrip("/"),
         validate_twilio=_bool(os.getenv("VALIDATE_TWILIO"), True),
+        google_client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
+        google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        secret_key=os.getenv("MUMU_SECRET_KEY", ""),
+        ingest_model=os.getenv("MUMU_INGEST_MODEL", "claude-haiku-5-5"),
+        sync_interval_seconds=int(os.getenv("SYNC_INTERVAL_SECONDS") or 300),
     )
