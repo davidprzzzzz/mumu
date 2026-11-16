@@ -55,7 +55,7 @@ def env(tmp_path):
     settings = make_settings(tmp_path)
     sessions = make_session_factory(settings.database_url)
     brain, sender = FakeBrain(), FakeSender()
-    client = TestClient(create_app(settings, brain, sender, sessions))
+    client = TestClient(create_app(settings, brain, sender, sessions, run_background=False))
     return client, brain, sender, sessions
 
 
@@ -151,7 +151,7 @@ def test_invalid_signature_is_rejected(tmp_path):
     settings = make_settings(tmp_path, validate=True)
     brain, sender = FakeBrain(), FakeSender()
     client = TestClient(
-        create_app(settings, brain, sender, make_session_factory(settings.database_url))
+        create_app(settings, brain, sender, make_session_factory(settings.database_url), run_background=False)
     )
 
     response = client.post(
@@ -170,7 +170,7 @@ def test_valid_signature_is_accepted(tmp_path):
     settings = make_settings(tmp_path, validate=True)
     brain, sender = FakeBrain(), FakeSender()
     client = TestClient(
-        create_app(settings, brain, sender, make_session_factory(settings.database_url))
+        create_app(settings, brain, sender, make_session_factory(settings.database_url), run_background=False)
     )
     data = {"From": ALICE, "Body": "Bonjour", "NumMedia": "0"}
     signature = RequestValidator(settings.twilio_auth_token).compute_signature(

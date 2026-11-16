@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .base import AccessRevoked, Event, SourceDocument
+from .base import AccessRevoked, AttachmentRef, Event, SourceDocument
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -39,6 +39,10 @@ SKIPPED_LABELS = {
 GMAIL_QUERY_FILTER = "-category:promotions -category:social -category:forums -in:sent -in:draft"
 
 MAX_TEXT_CHARS = 6000
+# Pieces jointes lues : PDF et images, 3 au plus, 5 Mo au plus chacune.
+ATTACHMENT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
+MAX_ATTACHMENTS = 3
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 
 
 def _decode_body(data: str) -> str:
@@ -54,15 +58,21 @@ def _strip_html(markup: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", text).strip()
 
 
-def _collect_parts(payload: dict, plain: list[str], rich: list[str]) -> None:
+def _collect_parts(payload: dict, plain: list[str], rich: list[str], files: list[AttachmentRef]) -> None:
     mime = payload.get("mimeType", "")
-    data = (payload.get("body") or {}).get("data")
-    if data and mime == "text/plain":
+    body = payload.get("body") or {}
+    data = body.get("data")
+    if payload.get("filename") and body.get("attachmentId"):
+        if mime in ATTACHMENT_TYPES and int(body.get("size") or 0) <= MAX_ATTACHMENT_BYTES:
+            files.append(
+                AttachmentRef(body["attachmentId"], payload["filename"][:200], mime, int(body.get("size") or 0))
+            )
+    elif data and mime == "text/plain":
         plain.append(_decode_body(data))
     elif data and mime == "text/html":
         rich.append(_decode_body(data))
     for part in payload.get("parts") or []:
-        _collect_parts(part, plain, rich)
+        _collect_parts(part, plain, rich, files)
 
 
 def parse_gmail_message(raw: dict) -> SourceDocument | None:
@@ -73,9 +83,10 @@ def parse_gmail_message(raw: dict) -> SourceDocument | None:
     headers = {h["name"].lower(): h["value"] for h in payload.get("headers") or []}
     plain: list[str] = []
     rich: list[str] = []
-    _collect_parts(payload, plain, rich)
+    files: list[AttachmentRef] = []
+    _collect_parts(payload, plain, rich, files)
     text = "\n".join(plain).strip() or _strip_html("\n".join(rich)) or raw.get("snippet", "")
-    if not text:
+    if not text and not files:
         return None
     received = datetime.fromtimestamp(int(raw.get("internalDate", "0")) / 1000, tz=timezone.utc)
     return SourceDocument(
@@ -85,6 +96,7 @@ def parse_gmail_message(raw: dict) -> SourceDocument | None:
         subject=headers.get("subject", ""),
         received_at=received,
         text=text[:MAX_TEXT_CHARS],
+        attachments=files[:MAX_ATTACHMENTS],
     )
 
 
@@ -204,6 +216,13 @@ class GoogleClient:
     def get_message(self, access_token: str, message_id: str) -> SourceDocument | None:
         raw = self._get(f"{GMAIL_URL}/messages/{message_id}", access_token, {"format": "full"})
         return parse_gmail_message(raw)
+
+    def get_attachment(self, access_token: str, message_id: str, attachment_id: str) -> bytes:
+        data = self._get(
+            f"{GMAIL_URL}/messages/{message_id}/attachments/{attachment_id}", access_token, {}
+        )
+        encoded = data.get("data", "")
+        return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
 
     def list_events(self, access_token: str, start: datetime, days: int = 14) -> list[Event]:
         data = self._get(

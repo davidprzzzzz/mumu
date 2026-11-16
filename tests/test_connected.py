@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.brain import Ingestion, Understanding, parse_ingestion
+from app.signals import Signal
 from app.calendar_logic import describe_calendar, find_tight_spots
 from app.connectors.base import AccessRevoked, Event, SourceDocument
 from app.connectors.google import GoogleClient, parse_calendar_event, parse_gmail_message
@@ -24,6 +25,7 @@ from app.models import (
     Message,
     Purchase,
     SeenDocument,
+    Workflow,
     make_session_factory,
 )
 from app.service import CONNECT_UNAVAILABLE, build_context
@@ -93,6 +95,9 @@ class FakeGoogle:
     def list_events(self, access, start, days=14):
         return self.events
 
+    def get_attachment(self, access, message_id, attachment_id):
+        return b"%PDF-fake"
+
 
 class ConnectedBrain:
     """Faux modele : repond aux messages et classe les documents."""
@@ -105,7 +110,7 @@ class ConnectedBrain:
     def understand(self, context, text, media):
         return self.next
 
-    def ingest(self, context, doc):
+    def ingest(self, context, doc, attachments=None):
         self.ingested.append(doc.external_id)
         return self.ingestions.get(doc.external_id, Ingestion(relevant=False))
 
@@ -113,11 +118,14 @@ class ConnectedBrain:
 BILL = Ingestion(
     relevant=True,
     label="Mail EDF du 16/11",
-    items=[{"kind": "paiement", "title": "Payer la facture EDF", "due_date": date(2026, 11, 30),
-            "amount_eur": 86.0, "owner": None, "confidence": 0.9}],
-    purchases=[{"merchant": "Amazon", "description": "Bouilloire", "amount_eur": 24.9,
-                "ordered_on": date(2026, 11, 15), "delivery_expected": date(2026, 11, 18),
-                "order_ref": "402-1"}],
+    items=[{"kind": "rendez_vous", "title": "Relevé du compteur", "due_date": date(2026, 11, 30),
+            "amount_eur": None, "owner": None, "confidence": 0.9}],
+    signals=[
+        Signal(type="invoice", title="Facture EDF", organization="EDF", amount_eur=86.0,
+               due_date=date(2026, 11, 30), confidence=0.9),
+        Signal(type="order", title="Bouilloire", organization="Amazon", amount_eur=24.9,
+               event_date=date(2026, 11, 15), due_date=date(2026, 11, 18), reference="402-1", confidence=0.9),
+    ],
     facts=["Client EDF"],
     notify="maintenant",
     message="Dans ton mail EDF : 86 € à payer avant le 30.",
@@ -135,7 +143,7 @@ def env(tmp_path):
     sessions = make_session_factory(settings.database_url)
     brain, sender, google = ConnectedBrain(), FakeSender(), FakeGoogle()
     client = TestClient(
-        create_app(settings, brain, sender, sessions, google, run_sync_loop=False),
+        create_app(settings, brain, sender, sessions, google, run_background=False),
         follow_redirects=False,
     )
     return client, brain, sender, sessions, google
@@ -227,8 +235,8 @@ def test_tight_spots_flag_overlap_and_short_gap_only():
 
 def test_parse_ingestion_downgrades_urgent_without_message():
     parsed = parse_ingestion({"relevant": True, "notify": "maintenant", "message": " ",
-                              "purchases": [{"merchant": "X"}]})
-    assert parsed.notify == "recap" and parsed.purchases == []
+                              "signals": [{"type": "inconnu", "title": "x", "confidence": 1}]})
+    assert parsed.notify == "recap" and parsed.signals == []
 
 
 # --- Connexion ------------------------------------------------------------
@@ -266,7 +274,7 @@ def test_connect_is_honest_when_google_is_not_configured(tmp_path):
     settings = make_settings(tmp_path)
     brain, sender = ConnectedBrain(), FakeSender()
     brain.next = Understanding(reply="Voici le lien.", action="connect_google")
-    client = TestClient(create_app(settings, brain, sender, make_session_factory(settings.database_url)))
+    client = TestClient(create_app(settings, brain, sender, make_session_factory(settings.database_url), run_background=False))
 
     say(client, "connecte mon gmail")
 
@@ -287,14 +295,18 @@ def test_first_pass_stores_privately_with_source_and_sends_one_summary(env):
 
     # Un seul message apres la confirmation : le resume, pas un message par mail.
     assert [body for _, body in sender.sent][1:] == [
-        "J'ai fait le tour de tes mails des 30 derniers jours : 1 chose(s) à suivre et 1 achat(s) repérés.\n"
-        "La plus proche : Payer la facture EDF, pour le 2026-11-30.\n"
+        "J'ai fait le tour de tes mails des 30 derniers jours : 1 démarche(s) à suivre, "
+        "1 chose(s) avec une date, 1 achat(s).\n"
+        "Le plus proche : Facture EDF, pour le 2026-11-30.\n"
         "Tu n'as rien à faire, je te préviens au bon moment."
     ]
     with sessions() as session:
         item = session.scalar(select(Item))
         assert (item.source_kind, item.source_ref, item.source_label) == ("gmail", "m1", "Mail EDF du 16/11")
         assert item.visibility == "private" and item.source_message_id is None
+        workflow = session.scalar(select(Workflow))
+        assert workflow.template == "payment" and workflow.visibility == "private"
+        assert [(s.source_kind, s.source_ref, s.label) for s in workflow.sources] == [("gmail", "m1", "Mail EDF du 16/11")]
         assert session.scalar(select(Purchase)).merchant == "Amazon"
         assert session.scalar(select(Fact).where(Fact.source_kind == "gmail")).visibility == "private"
         assert len(session.scalars(select(SeenDocument)).all()) == 3
@@ -393,10 +405,12 @@ def test_mail_derived_items_stay_private_to_their_owner(env):
         mine = build_context(session, alice, None, "Europe/Paris")
         theirs = build_context(session, flatmate, None, "Europe/Paris")
 
-    assert [title for _, title, _ in mine.open_items] == ["Payer la facture EDF"]
+    assert [title for _, title, _ in mine.open_items] == ["Relevé du compteur"]
     assert "Client EDF" in mine.facts and mine.purchase_lines
+    assert any("Facture EDF" in line for line in mine.workflow_lines)
     assert theirs.open_items == [] and theirs.facts == [] and theirs.purchase_lines == []
     assert theirs.calendar_lines == [] and theirs.recent_messages == []
+    assert theirs.workflow_lines == [] and theirs.agenda_lines == [] and theirs.money_lines == []
 
 
 def test_disconnect_revokes_and_erases_everything_derived(env):

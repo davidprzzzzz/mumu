@@ -27,6 +27,11 @@ class Settings:
     secret_key: str = ""
     ingest_model: str = "claude-haiku-5-5"
     sync_interval_seconds: int = 300
+    # Vocaux. Sans cle, MUMU dit qu'il ne sait pas encore ecouter.
+    openai_api_key: str = ""
+    transcription_model: str = "gpt-4o-transcribe"
+    # Le texte des conversations est efface apres ce delai (0 = jamais).
+    message_retention_days: int = 180
 
     @property
     def connections_enabled(self) -> bool:
@@ -50,4 +55,7 @@ def load_settings() -> Settings:
         secret_key=os.getenv("MUMU_SECRET_KEY", ""),
         ingest_model=os.getenv("MUMU_INGEST_MODEL", "claude-haiku-5-5"),
         sync_interval_seconds=int(os.getenv("SYNC_INTERVAL_SECONDS") or 300),
+        openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+        transcription_model=os.getenv("MUMU_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
+        message_retention_days=int(os.getenv("MESSAGE_RETENTION_DAYS") or 180),
     )
